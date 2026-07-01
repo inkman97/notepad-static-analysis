@@ -28,6 +28,16 @@ analysis cannot pin down is whether the HTTP request fires at load time or is
 deferred to the first render of the image; both are non-interactive, and only a
 dynamic test can establish the exact instant.
 
+Following the request one layer further down — into the system WinRT HTTP stack
+(`Windows.Web.dll` / `Windows.Web.Http.dll`) that `OleControls.dll` hands the
+request to — shows that this layer adds **no application-relevant scheme or host
+enforcement** either. It classifies the URL scheme to select protocol handling and
+records TLS/EDP properties, but there is no reject path for an unexpected scheme,
+no host allow-list, and no security-zone gate. This closes, on the negative side,
+the "the system runtime might enforce policy below what is visible" caveat that the
+earlier revision of these notes left open for the HTTP vector: within these two
+DLLs, no such application-level policy exists.
+
 The same lack of source validation opens a second, potentially higher-impact
 avenue: a UNC path (`\\host\share\x.png`) placed in the document is classified as
 a local file, has its `\\` prefix normalized rather than rejected, and is handed
@@ -46,6 +56,11 @@ was the usual one: map the attack surface, find where untrusted input enters,
 trace it towards dangerous operations, and identify the object's COM interfaces to
 understand how the container drives it. No dynamic testing was possible because
 the feature is not activatable in shipping builds.
+
+The system WinRT HTTP DLLs analysed in the dedicated section below —
+`Windows.Web.dll` (675,840 bytes) and `Windows.Web.Http.dll` (1,392,640 bytes),
+both x64 — were examined separately with `pefile` + Capstone for imports,
+strings, and targeted disassembly of the scheme-handling and send paths.
 
 ## Why this DLL is the interesting surface
 
@@ -161,10 +176,14 @@ test anywhere near this path is one that distinguishes local `C:\`-style paths (
 letter followed by `:` and a slash), which is local-path normalization for the
 file branch, not remote-URL validation.
 
-One honest caveat belongs here. `Windows.Web.Http.HttpClient` is a system WinRT
-runtime, so this analysis only demonstrates the absence of application-level checks
-inside `OleControls.dll`. It does not rule out policy that the system runtime might
-enforce a layer below what is visible here.
+One caveat belongs here, and it is now partially resolved. `Windows.Web.Http.HttpClient`
+is a system WinRT runtime, so the `OleControls.dll` analysis by itself only
+demonstrates the absence of application-level checks inside `OleControls.dll`. The
+dedicated section below follows the request into that system runtime and finds no
+application-relevant scheme/host policy there either; the one residual unknown is
+the lowest transport layer (the WinINet provider beneath the WinRT filter), which
+is generic system code shared by all callers rather than anything specific to
+Notepad.
 
 ### The object is an OLE embeddable, renderable through IViewObject
 
@@ -283,6 +302,94 @@ Combined with the `OleControls.dll` chain, where a URL of type 1 leads to an HTT
 fetch with no application-level check, the entire setup of the remote request is
 automatic on open.
 
+## Following the request into the system WinRT HTTP stack
+
+The `OleControls.dll` chain hands the outbound request to the WinRT
+`Windows.Web.Http` runtime. Because that runtime lives below the application, the
+earlier revision of these notes correctly flagged an open question: does the system
+runtime itself impose any host or scheme policy that the application code does not?
+To answer it, the two DLLs that implement this runtime — `Windows.Web.dll` and
+`Windows.Web.Http.dll` — were analysed directly. The finding is that they add no
+application-relevant scheme or host enforcement. The detail follows.
+
+### No direct network or security-zone imports
+
+`Windows.Web.Http.dll` imports no direct HTTP transport API and no security-zone
+API. There is no `wininet.dll`, no `winhttp.dll`, and no `urlmon.dll` in its import
+table, and consequently no `IInternetSecurityManager` / zone-mapping surface. The
+only security-adjacent import in the entire DLL is `ntdll!NtQuerySecurityAttributesToken`,
+which serves the Enterprise Data Protection (EDP/WIP) identity path, not URL
+filtering. The DLL is therefore a WinRT projection layer that builds the request
+object and delegates the actual send to a lower transport that is not one of these
+two files.
+
+The default filter that performs the connection, `HttpBaseProtocolFilterImpl`,
+exposes only *configuration* properties — `AllowAutoRedirect`, `AllowUI`,
+`UseProxy`, `ServerCredential`, `ProxyCredential`, `ClientCertificate`,
+`MaxConnectionsPerServer`, `IgnorableServerCertificateErrors`, and so on. None of
+these is a scheme/host gate, and there is no method resembling "reject if scheme
+not allowed" or "check zone for host".
+
+![No network / security-zone imports; filter exposes configuration only](images/08-http-imports.png)
+
+### The scheme is classified, never rejected
+
+The one place the request scheme is examined is a small comparison table
+(`https`, `ftps`, `wss`, `ftp`, `http`) around `0x180035800` in
+`Windows.Web.Http.dll`. Crucially, the result of that classification feeds a
+*property flag* and protocol selection — not an accept/reject decision. After the
+comparisons, the code does:
+
+```asm
+0x1800359a6: mov   eax, dword ptr [rsp + 0x70]   ; scheme enum value
+0x1800359aa: add   eax, -3
+0x1800359ad: cmp   eax, 1
+0x1800359b0: setbe al                            ; al = 1 if scheme in {3,4}
+0x1800359b3: mov   byte ptr [r14 + 0x91], al     ; store boolean on the object
+; execution falls straight through to session allocation:
+0x1800359cc: mov   ecx, 0x48
+0x1800359d1: call  0x18007f8c0                   ; allocate internal session
+```
+
+`setbe` writes a 0/1 byte recording a property of the scheme (e.g. "is
+secure/https-like"); it does not branch to any error or abort path. There is no
+`jz reject` / `jmp fail` anywhere across this table for an unrecognized scheme —
+every comparison either records a flag or selects protocol handling, and control
+then falls through into the internal-session allocation and continues. This is the
+same shape as the `OleControls.dll` classifier: sorting by scheme, not validating
+it.
+
+![Scheme classification with no reject path](images/07-http-scheme-classify.png)
+
+### The only policy layer is EDP/WIP, which does not filter schemes or hosts
+
+The single policy mechanism present in `Windows.Web.Http.dll` is Enterprise Data
+Protection / Windows Information Protection, visible from the string cluster
+`EDP://PolicyFlags`, `EDP://EvaluationFlags`, `EDP://EnterpriseIds`,
+`EDP://ExemptEnterpriseIds`, `EDP://IntentEnterpriseId`. This tags requests with
+enterprise identity for data-leak auditing/encryption on *managed* devices; it is
+not a scheme filter or a host allow-list, and on an unmanaged consumer machine it
+is effectively inert. Consistent with this, the whole binary contains no `Zone`,
+`block`, `deny`, or `forbidden` string.
+
+### What this settles, and the one residual unknown
+
+Within these two DLLs, the "system runtime might enforce scheme/host policy below
+the application" possibility is answered in the negative for the HTTP vector: the
+runtime takes the `RequestUri` it is given, classifies the scheme to pick protocol
+handling, applies TLS/EDP properties, and sends. Any scheme/host/consent check
+would have to live in the caller (`OleControls.dll`), where the earlier sections
+show there is none.
+
+Two honest limits remain. First, these DLLs build and delegate; the final socket
+I/O lives one layer further down, in the generic WinINet provider behind
+`HttpBaseProtocolFilterImpl`. That transport is shared by every WinRT HTTP caller
+on the system and is not specific to Notepad, so it is not expected to carry a
+Notepad-specific host allow-list, but it was not itself disassembled here. Second,
+the analysis remains static; on a device with WIP configured, the EDP flag implies
+behaviour *could* differ under data-protection policy, which is worth a line in any
+write-up.
+
 ## A second vector: UNC paths and NTLM credential leak
 
 The same root cause — no validation of the image source before it is acted on —
@@ -339,15 +446,29 @@ rejects the `\\` prefix, and (c) the normalized path is passed to a read-open wi
 `+0x18` open method is where a defensive UNC-reject check could still live, and
 that object is **not implemented in `OleControls.dll`** (its IID appears only once,
 as the interface requested at `1800461b8`, with no implementing vtable in this
-binary). It is not registered in the accessible packaged registry, and its GUID
-does not appear as a string in any package DLL, so the component could not be
-located and read. Nothing in the controllable code suggests a UNC filter — quite
-the opposite, since the upstream branch deliberately accepts and normalizes UNC —
-but the final open component could not be inspected. This vector is therefore a
-**motivated hypothesis with its last link open**, a notch below the HTTP vector,
-whose chain is fully visible inside `OleControls.dll`. Confirmation would come
-trivially from a network capture (a SYN to port 445 on an attacker-controlled host
-on document open), which is not currently possible because the feature is inert.
+binary). The package manifest (`AppxManifest.xml`) was re-checked directly against
+this CLSID and it appears nowhere in it: the only COM/activatable servers the
+package registers are `CA6CC9F1-…` → `NotepadExplorerCommand.dll`,
+`95b90fa7-…` → `OleControls.dll` (the ImageBlock itself), and the
+`NotepadXamlUI.*` activatable classes → `NotepadXamlUI.dll`. The open component is
+therefore **not shipped by the Notepad package**; it is an external system
+component, resolved either through the system COM catalog or via a dependency such
+as `Microsoft.WindowsAppRuntime.1.7`. Because the image feature is inert in
+shipping builds, the corresponding `CoCreateInstance` has presumably never run, so
+the CLSID is not present in the accessible packaged registry and its GUID does not
+appear as a string in any package DLL — which is why the component could not be
+located and read from the package alone. Its behaviour (a `+0x18` method that opens
+a path for `GENERIC_READ` and returns a stream) is consistent with a file/stream
+abstraction from the system storage stack. Nothing in the controllable code
+suggests a UNC filter — quite the opposite, since the upstream branch deliberately
+accepts and normalizes UNC — but the final open component could not be inspected.
+This vector is therefore a **motivated hypothesis with its last link open**, a
+notch below the HTTP vector, whose chain is fully visible inside `OleControls.dll`.
+Confirmation would come trivially from a network capture (a SYN to port 445 on an
+attacker-controlled host on document open), which is not currently possible because
+the feature is inert. Locating the component itself would come from a binary search
+of the system image for the IID/CLSID bytes (`EC5EC8A9…` / `317D06E8…`) across
+`System32`, `SysWOW64`, and `WinSxS`, on a build where the feature is present.
 
 ## What is not established
 
@@ -362,10 +483,13 @@ of the behaviour does not depend on the answer, but only dynamic observation can
 say exactly when the packet leaves. This point is strongly supported as automatic;
 the precise timing is unconfirmed.
 
-The second is whether the system runtime imposes any policy of its own. The
-`Windows.Web.Http` stack lives below the application, and this analysis only
-covers the application code. It is possible, though not visible here, that the
-runtime applies some host or scheme policy.
+The second is the lowest transport layer. The application code (`OleControls.dll`)
+and the WinRT projection layer (`Windows.Web.dll` / `Windows.Web.Http.dll`) have
+both now been examined and neither applies an application-relevant host/scheme
+policy. The remaining unexamined layer is the generic WinINet provider beneath
+`HttpBaseProtocolFilterImpl`, which is system-wide code shared by all WinRT HTTP
+callers rather than anything Notepad-specific. It was not disassembled here, and on
+a WIP-managed device the EDP path could in principle change behaviour.
 
 The third is simply that none of this has been observed at runtime, because the
 feature cannot be activated in shipping builds.
@@ -435,6 +559,19 @@ The following table collects the functions referenced above for quick lookup.
 | User-Agent | OleControls case 4 | `Notepad (Windows NT 10.0)` |
 | `IViewObject` IID | `180046e50` | `0000010D-...-46` (rendering) |
 | `IOleObject` IID | `180046e60` | `00000112-...-46` (embedding) |
+
+### System WinRT HTTP stack (`Windows.Web.dll` / `Windows.Web.Http.dll`)
+
+| Item | Binary | Role / finding |
+|---|---|---|
+| Scheme table `0x180035800` | Windows.Web.Http | Compares `https/ftps/wss/ftp/http`; classifies, no reject path |
+| `setbe [r14+0x91]` @ `0x1800359b0` | Windows.Web.Http | Records scheme property; falls through to session alloc |
+| `HttpBaseProtocolFilterImpl` | Windows.Web.Http | Default filter; exposes configuration only (redirect/proxy/creds/cert) |
+| `HttpClientImpl::CheckHttpRequestMessage` | Windows.Web.Http | Message-structure check; not a scheme/host gate |
+| `NtQuerySecurityAttributesToken` | Windows.Web.Http | Only security-adjacent import; EDP identity, not URL filtering |
+| `EDP://PolicyFlags` (+ EnterpriseIds) | Windows.Web.Http | WIP audit/tagging only; not a scheme/host filter; inert unmanaged |
+| Direct `wininet`/`winhttp`/`urlmon` imports | Windows.Web.Http | **None** — projection layer; transport is one layer further down |
+| `Zone` / `block` / `deny` / `forbidden` strings | Windows.Web.Http | **0 occurrences** in the binary |
 
 ---
 *Static analysis notes, no dynamic confirmation. Shared for research documentation;
