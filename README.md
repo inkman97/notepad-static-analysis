@@ -36,15 +36,6 @@ problem, but only actually running it would tell you precisely when the packet
 leaves. Until someone can do that, treat the remote-fetch behaviour as a
 well-supported hypothesis, not a proven bug.
 
-A couple of other honest caveats. This is unreleased, in-development code, and
-Microsoft has form for hardening exactly this kind of thing before it ships —
-they added URI checks and prompts to Notepad's Markdown link handling earlier this
-year after CVE-2026-20841, which is the same neighbourhood. So the code that
-eventually reaches everyone might look different from what's described here. And
-the HTTP client is a system component, so it's possible some policy lives below
-the application layer where I can't see it. None of that is a reason to ignore
-what the current code shows, but it's a reason not to oversell it.
-
 The full write-up, with the function-by-function trace across both binaries and
 the Ghidra screenshots, is in
 [`notepad-imageblock-analysis.md`](notepad-imageblock-analysis.md). One useful
