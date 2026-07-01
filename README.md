@@ -23,26 +23,44 @@ booby-trapped document could quietly make Notepad phone home to a server the
 attacker picked, which is the kind of thing you really don't expect a text editor
 to do.
 
-I want to be upfront about what this is and isn't. It's a **static** analysis —
-I read the code, I didn't run it, because I couldn't turn the feature on. So the
-whole chain is traced through disassembly, not observed live. Most of it I'm
+While tracing that, I noticed a second and potentially nastier path. The same code
+that classifies the image source doesn't just accept `http` URLs — it also has a
+branch for local files, and a UNC path like `\\attacker\share\x.png` lands in it.
+Instead of rejecting the remote share, the code normalizes the `\\` prefix and
+passes the path straight to a read-open. On Windows, opening a UNC path for reading
+makes the machine authenticate to that share over SMB — which means, if the source
+points at an attacker's server with something like Responder listening, opening the
+document could leak an NTLMv2 hash. That's a big step up from "leaks your IP": it's
+a credential you can crack offline or relay. I traced this one right up to the
+final open call, but the component that actually performs the open lives outside
+`OleControls.dll` and I couldn't locate it to read it, so the very last link — does
+that component reject UNC paths before opening them? — is unconfirmed. Everything
+leading up to it says it doesn't, but I can't prove the last step from static
+analysis alone.
+
+I want to be upfront about what this is and isn't. It's a static analysis — I read
+the code, I didn't run it, because I couldn't turn the feature on. So the whole
+chain is traced through disassembly, not observed live. Most of the HTTP path I'm
 confident about: the URL genuinely comes from the document, there genuinely isn't
 an app-level check, and the deserialization that pulls out the URL genuinely
-happens on open without interaction. The one thing I can't pin down from static
-analysis alone is the exact moment the network request goes out — whether it's the
-instant the document loads or the first time the image gets painted on screen.
-Both of those are "no click required", so it doesn't change the shape of the
-problem, but only actually running it would tell you precisely when the packet
-leaves. Until someone can do that, treat the remote-fetch behaviour as a
-well-supported hypothesis, not a proven bug.
+happens on open without interaction. The one thing I can't pin down there is the
+exact moment the network request goes out — whether it's the instant the document
+loads or the first time the image gets painted on screen. Both of those are "no
+click required", so it doesn't change the shape of the problem, but only actually
+running it would tell you precisely when the packet leaves. The SMB/NTLM path is a
+notch less certain than the HTTP one, because its last link sits in a component I
+couldn't read. Treat the HTTP remote-fetch as a well-supported hypothesis and the
+NTLM-leak as a plausible-but-unconfirmed one, not proven bugs.
 
 The full write-up, with the function-by-function trace across both binaries and
 the Ghidra screenshots, is in
 [`notepad-imageblock-analysis.md`](notepad-imageblock-analysis.md). One useful
 byproduct that's in there: I worked out the on-disk format of the image metadata
-(how the URL is stored inside the document), which is the piece you'd need to
-build a test document by hand and finally confirm the behaviour dynamically —
-possibly even before the UI button starts working.
+(how the URL — or the UNC path — is stored inside the document), which is the piece
+you'd need to build a test document by hand and finally confirm the behaviour
+dynamically — possibly even before the UI button starts working. For the SMB
+variant in particular, confirmation is cheap: point the source at a share you
+control, open the document, and watch for a connection to port 445.
 
 If any of this turns out to be real once the feature is live, the right thing to
 do is report it to Microsoft through MSRC (https://msrc.microsoft.com), and a
